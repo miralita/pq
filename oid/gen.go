@@ -49,7 +49,7 @@ func main() {
 	fmt.Fprintln(w, "\npackage oid")
 	fmt.Fprintln(w, "const (")
 	rows, err := db.Query(`
-		SELECT typname, oid
+		SELECT typname, oid, typcategory, typelem
 		FROM pg_type WHERE oid < 10000
 		ORDER BY oid;
 	`)
@@ -58,17 +58,28 @@ func main() {
 	}
 	var name string
 	var oid int
+	var typcategory string
+	var typelem int
+	arrayTypes := make(map[int]int)
 	for rows.Next() {
-		err = rows.Scan(&name, &oid)
+		err = rows.Scan(&name, &oid, &typcategory, &typelem)
 		if err != nil {
 			log.Fatal(err)
 		}
 		fmt.Fprintf(w, "T_%s Oid = %d\n", name, oid)
+		if typcategory == "A" {
+			arrayTypes[oid] = typelem
+		}
 	}
 	if err = rows.Err(); err != nil {
 		log.Fatal(err)
 	}
 	fmt.Fprintln(w, ")")
+	fmt.Fprintln(w, "var arrayTypes = map[Oid]Oid{")
+	for k, v := range arrayTypes {
+		fmt.Fprintf(w, "%d: %d,\n", k, v)
+	}
+	fmt.Fprintln(w, "}")
 	w.Close()
 	cmd.Wait()
 }

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -56,7 +57,9 @@ func encode(parameterStatus *parameterStatus, x interface{}, pgtypOid oid.Oid) [
 }
 
 func decode(parameterStatus *parameterStatus, s []byte, typ oid.Oid, f format) interface{} {
-	if f == formatBinary {
+	if oid.IsArrayType(typ) {
+		return arrayDecode(parameterStatus, s, typ, f)
+	} else if f == formatBinary {
 		return binaryDecode(parameterStatus, s, typ)
 	} else {
 		return textDecode(parameterStatus, s, typ)
@@ -114,6 +117,76 @@ func textDecode(parameterStatus *parameterStatus, s []byte, typ oid.Oid) interfa
 	}
 
 	return s
+}
+
+type arrayValues struct {
+	s     []byte
+	Value []byte
+	start int
+	cur   int
+	sep   byte
+}
+
+func (a *arrayValues) Next() bool {
+	if a.cur == 0 {
+		a.cur = 1
+		a.start = 1
+		a.sep = byte(int(','))
+	}
+	for a.cur < len(a.s)-1 {
+		if a.s[a.cur] == a.sep {
+			a.Value = a.s[a.start:a.cur]
+			a.start = a.cur + 1
+			a.cur++
+			return true
+		}
+		a.cur++
+	}
+	return false
+}
+
+func arrayDecode(parameterStatus *parameterStatus, s []byte, typ oid.Oid, f format) interface{} {
+	values := &arrayValues{}
+	values.s = s
+
+	arrtyp := oid.GetArrayType(typ)
+	switch arrtyp {
+	case oid.T_bytea:
+		var ret [][]byte
+		for values.Next() {
+			v := decode(parameterStatus, values.Value, arrtyp, f)
+			ret = append(ret, v.([]byte))
+		}
+		return ret
+	case oid.T_time, oid.T_timetz:
+		var ret []time.Time
+		for values.Next() {
+			v := decode(parameterStatus, values.Value, arrtyp, f)
+			ret = append(ret, v.(time.Time))
+		}
+		return ret
+	case oid.T_bool:
+		var ret []bool
+		for values.Next() {
+			v := decode(parameterStatus, values.Value, arrtyp, f)
+			ret = append(ret, v.(bool))
+		}
+		return ret
+	case oid.T_int8, oid.T_int4, oid.T_int2:
+		var ret []int64
+		for values.Next() {
+			v := decode(parameterStatus, values.Value, arrtyp, f)
+			ret = append(ret, v.(int64))
+		}
+		return ret
+	default:
+		var ret []interface{}
+		for values.Next() {
+			v := decode(parameterStatus, values.Value, arrtyp, f)
+			ret = append(ret, v)
+		}
+		return ret
+	}
 }
 
 // appendEncodedText encodes item in text format as required by COPY
@@ -535,4 +608,81 @@ func (nt NullTime) Value() (driver.Value, error) {
 		return nil, nil
 	}
 	return nt.Time, nil
+}
+
+type converter struct{}
+
+func (converter) ConvertValue(v interface{}) (driver.Value, error) {
+	if driver.IsValue(v) {
+		return v, nil
+	}
+
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Slice:
+		var buf bytes.Buffer
+		buf.WriteString("{")
+
+		if rv.Len() > 0 {
+			var conv func(reflect.Value) string
+			dv := rv.Index(0)
+
+			if valuer, ok := dv.Interface().(driver.Valuer); ok {
+				val, err := valuer.Value()
+				if err != nil {
+					return nil, fmt.Errorf("from Value: %v", err)
+				}
+				dv = reflect.ValueOf(val)
+			}
+
+			switch dv.Kind() {
+			case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+				conv = func(v reflect.Value) string {
+					return strconv.FormatInt(v.Int(), 10)
+				}
+			case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+				conv = func(v reflect.Value) string {
+					return strconv.FormatUint(v.Uint(), 10)
+				}
+			case reflect.Float64:
+				conv = func(v reflect.Value) string {
+					return strconv.FormatFloat(v.Float(), 'g', -1, 64)
+				}
+			case reflect.Float32:
+				conv = func(v reflect.Value) string {
+					return strconv.FormatFloat(rv.Float(), 'g', -1, 32)
+				}
+			case reflect.Bool:
+				conv = func(v reflect.Value) string {
+					return strconv.FormatBool(v.Bool())
+				}
+			case reflect.String:
+				conv = func(v reflect.Value) string {
+					return v.String()
+				}
+			case reflect.Struct:
+				switch dv.Interface().(type) {
+				case time.Time:
+					conv = func(v reflect.Value) string {
+						return string(formatTs(v.Interface().(time.Time)))
+					}
+				}
+			default:
+				return nil, fmt.Errorf("unsupported type %T, a %s", v, rv.Kind())
+			}
+
+			for i := 0; i < rv.Len(); i++ {
+				buf.WriteString(conv(rv.Index(i)))
+				if i < rv.Len()-1 {
+					buf.WriteString(",")
+				}
+			}
+		}
+
+		buf.WriteString("}")
+		return buf.String(), nil
+	}
+
+	// Fallback to the driver default converter for all other types
+	return driver.DefaultParameterConverter.ConvertValue(v)
 }

@@ -1338,6 +1338,10 @@ func (st *stmt) NumInput() int {
 	return len(st.paramTyps)
 }
 
+func (st *stmt) ColumnConverter(idx int) driver.ValueConverter {
+	return converter{}
+}
+
 // parseComplete parses the "command tag" from a CommandComplete message, and
 // returns the number of rows affected (if applicable) and a string
 // identifying only the command that was executed, e.g. "ALTER TABLE".  If the
